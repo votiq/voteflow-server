@@ -1,6 +1,7 @@
 import json
 import html
 import logging
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -8,9 +9,10 @@ from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.validators import validate_email
 from django.db import transaction
 from django.db.models import F, Q, Sum
+from django.db.models.functions import TruncDate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from ninja import File, Form, Router
+from ninja import File, Form, Router, Schema
 from ninja.files import UploadedFile
 from ninja.pagination import paginate
 from ninja_jwt.authentication import JWTAuth
@@ -25,7 +27,7 @@ from payments.services import (
     create_inline_poll_payment,
     verify_paystack_transaction,
 )
-from voting.models import VoteAuditLog
+from voting.models import Vote, VoteAuditLog
 from voting.services import create_vote, is_rate_limited
 
 from .models import Contestant, Poll
@@ -41,6 +43,11 @@ from .schemas import (
 
 logger = logging.getLogger(__name__)
 router = Router(tags=["Polls"])
+
+
+class VoteTrendPoint(Schema):
+    date: date
+    votes: int
 
 
 def _poll_queryset():
@@ -86,6 +93,35 @@ def list_polls(
 @paginate
 def my_polls(request):
     return _poll_queryset().filter(creator=request.user).order_by("-created_at")
+
+
+@router.get("/my-polls/analytics/", response=list[VoteTrendPoint], auth=JWTAuth())
+@require_role(User.Role.ORGANIZER, User.Role.ADMIN)
+def my_poll_vote_trend(request):
+    end_date = timezone.localdate()
+    start_date = end_date - timedelta(days=6)
+    start_at = timezone.make_aware(
+        datetime.combine(start_date, time.min), timezone.get_current_timezone()
+    )
+    end_at = start_at + timedelta(days=7)
+    daily_totals = {
+        row["day"]: row["votes"]
+        for row in Vote.objects.filter(
+            poll__creator=request.user,
+            created_at__gte=start_at,
+            created_at__lt=end_at,
+        )
+        .annotate(day=TruncDate("created_at", tzinfo=timezone.get_current_timezone()))
+        .values("day")
+        .annotate(votes=Sum("vote_quantity"))
+    }
+    return [
+        {
+            "date": start_date + timedelta(days=offset),
+            "votes": daily_totals.get(start_date + timedelta(days=offset), 0),
+        }
+        for offset in range(7)
+    ]
 
 
 @router.get("/{slug}/", response=PollSchema)

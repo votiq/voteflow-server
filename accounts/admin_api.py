@@ -5,17 +5,18 @@ from datetime import datetime
 from typing import Optional
 
 from django.core.exceptions import ValidationError
-from django.db.models import Q
+from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
 from ninja import Router, Schema
 from ninja.pagination import paginate
 from ninja_jwt.authentication import JWTAuth
 
-from accounts.models import User
+from accounts.models import OrganizerProfile, User
 from accounts.permissions import require_role
-from polls.models import Contest
+from payments.models import Payment
+from polls.models import Contest, Poll
 from polls.services import suspend_contest
-from voting.models import AuditLog
+from voting.models import AuditLog, Vote
 
 router = Router(tags=["Administration"])
 
@@ -48,6 +49,85 @@ class AuditLogSchema(Schema):
     ip_hash: str
     device_fingerprint: str
     metadata: dict
+
+
+class AdminDashboardActivitySchema(Schema):
+    id: uuid.UUID
+    action_type: str
+    resource_type: str
+    timestamp: datetime
+
+
+class AdminDashboardSchema(Schema):
+    total_users: int
+    active_users: int
+    voter_accounts: int
+    organizer_accounts: int
+    administrator_accounts: int
+    pending_organizer_requests: int
+    total_polls: int
+    active_polls: int
+    total_contests: int
+    live_contests: int
+    suspended_contests: int
+    total_votes: int
+    confirmed_payments: int
+    pending_payments: int
+    recent_activity: list[AdminDashboardActivitySchema]
+
+
+@router.get("/dashboard/", response=AdminDashboardSchema, auth=JWTAuth())
+@require_role(User.Role.ADMIN)
+def dashboard_summary(request):
+    user_counts = User.objects.aggregate(
+        total=Count("id"),
+        active=Count("id", filter=Q(is_active=True)),
+        voters=Count("id", filter=Q(role=User.Role.USER)),
+        organizers=Count("id", filter=Q(role=User.Role.ORGANIZER)),
+        administrators=Count("id", filter=Q(role=User.Role.ADMIN)),
+    )
+    poll_counts = Poll.objects.aggregate(
+        total=Count("id"),
+        active=Count(
+            "id",
+            filter=Q(
+                status__in=(Poll.Status.ACTIVE, Poll.Status.ENDING_SOON, Poll.Status.NEW)
+            ),
+        ),
+    )
+    contest_counts = Contest.objects.aggregate(
+        total=Count("id"),
+        live=Count("id", filter=Q(state=Contest.State.LIVE)),
+        suspended=Count("id", filter=Q(state=Contest.State.SUSPENDED)),
+    )
+    payment_counts = Payment.objects.aggregate(
+        confirmed=Count("id", filter=Q(status=Payment.Status.CONFIRMED)),
+        pending=Count("id", filter=Q(status=Payment.Status.PENDING)),
+    )
+
+    return {
+        "total_users": user_counts["total"],
+        "active_users": user_counts["active"],
+        "voter_accounts": user_counts["voters"],
+        "organizer_accounts": user_counts["organizers"],
+        "administrator_accounts": user_counts["administrators"],
+        "pending_organizer_requests": OrganizerProfile.objects.filter(
+            is_approved=False
+        ).count(),
+        "total_polls": poll_counts["total"],
+        "active_polls": poll_counts["active"],
+        "total_contests": contest_counts["total"],
+        "live_contests": contest_counts["live"],
+        "suspended_contests": contest_counts["suspended"],
+        "total_votes": Vote.objects.aggregate(total=Sum("vote_quantity"))["total"] or 0,
+        "confirmed_payments": payment_counts["confirmed"],
+        "pending_payments": payment_counts["pending"],
+        "recent_activity": list(
+            AuditLog.objects.order_by("-timestamp").values(
+                "id", "action_type", "resource_type", "timestamp"
+            )[:6]
+        ),
+    }
 
 
 @router.get("/users/", response=list[AdminUserSchema], auth=JWTAuth())
